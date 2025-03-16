@@ -16,7 +16,6 @@ from evernote.edam.error.ttypes import EDAMSystemException, EDAMErrorCode
 # API Configuration - Replace with your values
 CONSUMER_KEY = 'YOUR-CONSUMER-KEY'
 CONSUMER_SECRET = 'YOUR-CONSUMER-SECRET'
-NOTEBOOK_NAME = 'YOUR-NOTEBOOK-NAME'
 SANDBOX = False  # Set to False for production
 
 # Rate limiting configuration
@@ -145,12 +144,45 @@ def update_note_dates():
         print(f"Error authenticating with Evernote: {e}")
         return
     
-    # Get the notebook GUID
-    notebook_guid = api_call_with_backoff(get_notebook_guid, note_store, NOTEBOOK_NAME)
-    if not notebook_guid:
+    # Prompt user for notebook name
+    print("\nRetrieving available notebooks...")
+    try:
+        notebooks = api_call_with_backoff(note_store.listNotebooks)
+        print("Available notebooks:")
+        for i, notebook in enumerate(notebooks, 1):
+            print(f"{i}. {notebook.name}")
+        
+        # Get user selection
+        while True:
+            notebook_input = input("\nEnter notebook name or number to process: ")
+            
+            # Check if input is a number
+            if notebook_input.isdigit():
+                index = int(notebook_input) - 1
+                if 0 <= index < len(notebooks):
+                    notebook_name = notebooks[index].name
+                    notebook_guid = notebooks[index].guid
+                    break
+                else:
+                    print(f"Invalid number. Please enter a number between 1 and {len(notebooks)}.")
+            else:
+                # Input is a name, try to find matching notebook
+                notebook_guid = None
+                for notebook in notebooks:
+                    if notebook.name.lower() == notebook_input.lower():
+                        notebook_name = notebook.name
+                        notebook_guid = notebook.guid
+                        break
+                
+                if notebook_guid:
+                    break
+                else:
+                    print("Notebook not found. Please try again.")
+    except Exception as e:
+        print(f"Error listing notebooks: {e}")
         return
     
-    print(f"Found notebook: {NOTEBOOK_NAME}")
+    print(f"Selected notebook: {notebook_name}")
     
     # Set up the search filter to only get the metadata we need
     note_filter = NoteFilter(notebookGuid=notebook_guid)
