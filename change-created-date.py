@@ -4,6 +4,11 @@ import time
 import webbrowser
 import random
 import inspect
+import http.server
+import socketserver
+import threading
+import urllib.parse
+import pyperclip  # For clipboard functionality
 
 # Add compatibility shim for Python 3.11+
 if not hasattr(inspect, 'getargspec'):
@@ -24,8 +29,96 @@ MAX_BACKOFF = 60     # Maximum backoff time in seconds
 MAX_RETRIES = 5      # Maximum number of retries per operation
 BATCH_SIZE = 10      # Process notes in batches of this size
 
+# OAuth callback server
+class OAuthCallbackHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def do_GET(self):
+        """Handle GET request to the callback URL"""
+        # Parse the query string
+        query = urllib.parse.urlparse(self.path).query
+        params = dict(urllib.parse.parse_qsl(query))
+        
+        # Check if the oauth_verifier is present
+        if 'oauth_verifier' in params:
+            oauth_verifier = params['oauth_verifier']
+            # Make the oauth_verifier available to the main thread
+            self.server.oauth_verifier = oauth_verifier
+            
+            # Send a response to the browser
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            # Create a simple HTML page with the verification code
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Evernote Authentication</title>
+                <style>
+                    body {{ font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }}
+                    .container {{ max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ccc; border-radius: 5px; }}
+                    .code {{ font-size: 24px; font-weight: bold; margin: 20px 0; padding: 10px; background-color: #f0f0f0; border-radius: 3px; }}
+                    .success {{ color: green; }}
+                    button {{ padding: 10px 20px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }}
+                    button:hover {{ background-color: #45a049; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>Evernote Authentication Successful</h1>
+                    <p>Your verification code is:</p>
+                    <div class="code">{oauth_verifier}</div>
+                    <p class="success">✓ This code has been automatically copied to your clipboard!</p>
+                    <p>You can now return to the terminal to continue.</p>
+                    <button onclick="window.close()">Close Window</button>
+                </div>
+                <script>
+                    // Copy the verification code to the clipboard
+                    try {{
+                        navigator.clipboard.writeText("{oauth_verifier}");
+                    }} catch (err) {{
+                        console.error('Failed to copy: ', err);
+                    }}
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+        else:
+            # If no oauth_verifier is present, send a generic response
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"Authentication callback received, but no verification code found.")
+
+    def log_message(self, format, *args):
+        """Suppress server logs"""
+        return
+
+def start_oauth_callback_server(port=8080):
+    """Start a temporary HTTP server to handle OAuth callback"""
+    server = socketserver.TCPServer(("localhost", port), OAuthCallbackHandler)
+    server.oauth_verifier = None
+    
+    # Start the server in a separate thread
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    
+    return server
+
 def get_access_token():
     """Get OAuth access token using the consumer key and secret"""
+    print("Starting OAuth authentication process...")
+    
+    # Start the callback server
+    callback_port = 8080
+    callback_url = f"http://localhost:{callback_port}"
+    server = start_oauth_callback_server(callback_port)
+    
     client = EvernoteClient(
         consumer_key=CONSUMER_KEY,
         consumer_secret=CONSUMER_SECRET,
@@ -33,7 +126,7 @@ def get_access_token():
     )
     
     # Get the request token
-    request_token = client.get_request_token('http://localhost')
+    request_token = client.get_request_token(callback_url)
     
     # Generate the authorization URL
     authorize_url = client.get_authorize_url(request_token)
@@ -43,9 +136,37 @@ def get_access_token():
     print(f"Authorization URL: {authorize_url}")
     webbrowser.open(authorize_url)
     
-    # Get the verification code from the user
-    print("\nAfter authorizing, Evernote will show you a verification code.")
-    oauth_verifier = input("Enter the verification code: ")
+    # Wait for the callback to be received
+    print("\nWaiting for authentication in browser...")
+    print("(If the browser doesn't open automatically, please copy and paste the URL above)")
+    
+    # Wait for the oauth_verifier with a timeout
+    max_wait_time = 300  # 5 minutes
+    wait_interval = 1
+    elapsed_time = 0
+    
+    while server.oauth_verifier is None and elapsed_time < max_wait_time:
+        time.sleep(wait_interval)
+        elapsed_time += wait_interval
+    
+    # Stop the server
+    server.shutdown()
+    
+    if server.oauth_verifier:
+        oauth_verifier = server.oauth_verifier
+        print(f"Authentication successful! Verification code: {oauth_verifier}")
+        
+        # Try to copy to clipboard
+        try:
+            pyperclip.copy(oauth_verifier)
+            print("Verification code copied to clipboard!")
+        except Exception as e:
+            print(f"Could not copy to clipboard: {e}")
+            print("Please copy the verification code manually.")
+    else:
+        print("\nAuthentication timed out or failed.")
+        print("Please enter the verification code manually.")
+        oauth_verifier = input("Enter the verification code: ")
     
     # Get the access token using the verification code
     try:
@@ -57,21 +178,6 @@ def get_access_token():
         return access_token
     except Exception as e:
         print(f"Error getting access token: {e}")
-        return None
-
-def get_notebook_guid(note_store, notebook_name):
-    """Find the GUID of the specified notebook"""
-    try:
-        notebooks = note_store.listNotebooks()
-        for notebook in notebooks:
-            if notebook.name == notebook_name:
-                return notebook.guid
-        print(f"Notebook '{notebook_name}' not found. Available notebooks:")
-        for notebook in notebooks:
-            print(f"- {notebook.name}")
-        return None
-    except Exception as e:
-        print(f"Error listing notebooks: {e}")
         return None
 
 def extract_date_from_title(title):
@@ -121,6 +227,21 @@ def api_call_with_backoff(func, *args, **kwargs):
     
     # If we've exhausted our retries
     raise Exception(f"Failed after {MAX_RETRIES} retries due to rate limiting")
+
+def get_notebook_guid(note_store, notebook_name):
+    """Find the GUID of the specified notebook"""
+    try:
+        notebooks = note_store.listNotebooks()
+        for notebook in notebooks:
+            if notebook.name == notebook_name:
+                return notebook.guid
+        print(f"Notebook '{notebook_name}' not found. Available notebooks:")
+        for notebook in notebooks:
+            print(f"- {notebook.name}")
+        return None
+    except Exception as e:
+        print(f"Error listing notebooks: {e}")
+        return None
 
 def update_note_dates():
     """Main function to update note creation dates"""
@@ -268,14 +389,14 @@ def update_note_dates():
             delay = random.uniform(1.0, 2.0)
             print(f"Waiting {delay:.1f} seconds before next batch...")
             time.sleep(delay)
-    
+
     # Print summary
     print("\n====== SUMMARY ======")
     print(f"Total notes processed: {processed}")
     print(f"Notes updated: {updated}")
     print(f"Errors encountered: {len(errors)}")
     print(f"Progress log saved to: {session_file}")
-    
+
     if errors:
         print("\nErrors:")
         for error in errors:
